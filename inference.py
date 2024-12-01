@@ -66,7 +66,7 @@ class MCMOT:
         num_cams: int,
         similarity_threshold: float,
         gallery_similarity_threshold: float,
-        alpha: float,  # Коэффициент обновления центроидов
+        alpha: float,
         confirmation_threshold: int,
         log_dir: str,
         tracker_path: str,
@@ -94,7 +94,7 @@ class MCMOT:
 
         self._similarity_threshold = similarity_threshold
         self._gallery_similarity_threshold = gallery_similarity_threshold
-        self._alpha = alpha  # Коэффициент обновления центроидов
+        self._alpha = alpha
         self.confirmation_threshold = confirmation_threshold
         self.buffer_size = 12
 
@@ -113,80 +113,17 @@ class MCMOT:
         # Галерея
         self.gallery_centroids = {}          # gallery_id -> centroid_embedding
         self.global_id_to_gallery_id = {}    # global_id -> gallery_id
-        self.gallery_id_to_global_id = {}    # gallery_id -> global_id
         self.next_gallery_id = 1             # Счётчик для присвоения новых gallery_id
-
-        # Счётчики кадров
-        self.id_frame_counts = {}  # global_id -> int
-
-        # Параметры для динамического обновления
-        self.min_frames_for_alpha = 16  # Количество кадров для начала уменьшения alpha
 
         # Создание директории для логов
         os.makedirs(self._log_dir, exist_ok=True)
 
-    def get_dynamic_alpha(self, global_id: int) -> float:
-        """
-        Возвращает динамический коэффициент alpha для данного global_id.
-        Чем больше кадров, тем меньше alpha.
-
-        :param global_id: Глобальный идентификатор.
-        :return: Динамический коэффициент alpha.
-        """
-        frame_count = self.id_frame_counts.get(global_id, 1)
-        dynamic_alpha = self._alpha / (1 + frame_count / self.min_frames_for_alpha)
-        dynamic_alpha = max(dynamic_alpha, self._alpha / 2)  # Ограничиваем минимальным значением
-        return dynamic_alpha
-
-    def _update_centroid(self, global_id: int, new_embedding: torch.Tensor):
-        """
-        Обновляет центроид для global_id новым эмбеддингом и учитывает количество кадров.
-
-        :param global_id: Глобальный идентификатор.
-        :param new_embedding: Новый эмбеддинг.
-        """
-        # Инициализация центроида, если он отсутствует
-        if global_id not in self.id_centroids:
-            self.id_centroids[global_id] = new_embedding.clone()
-            self.id_frame_counts[global_id] = 1
-            self.id_embedding_buffers[global_id] = [new_embedding]
-            return
-
-        # Увеличиваем счётчик кадров
-        self.id_frame_counts[global_id] += 1
-
-        # Получаем текущий alpha
-        dynamic_alpha = self.get_dynamic_alpha(global_id)
-
-        # Обновляем центроид как скользящее среднее
-        old_centroid = self.id_centroids[global_id]
-        updated_centroid = dynamic_alpha * new_embedding + (1 - dynamic_alpha) * old_centroid
-        updated_centroid = F.normalize(updated_centroid, p=2, dim=0)
-        self.id_centroids[global_id] = updated_centroid
-
-        # Обновляем буфер эмбеддингов
-        self.id_embedding_buffers[global_id].append(new_embedding)
-        if len(self.id_embedding_buffers[global_id]) > self.buffer_size:
-            self.id_embedding_buffers[global_id].pop(0)
-
-    def _update_gallery(self, global_id: int, embedding: torch.Tensor):
-        """
-        Обновляет центроид галереи для данного global_id.
-
-        :param global_id: Глобальный идентификатор.
-        :param embedding: Новый эмбеддинг.
-        """
+    def _update_gallery(self, global_id, embedding):
         if global_id not in self.gallery_centroids:
             self.gallery_centroids[global_id] = embedding
-            self.gallery_id_to_global_id[global_id] = global_id  # Первоначально gallery_id совпадает с global_id
         else:
-            # Получаем счётчик кадров для оценки надежности
-            frame_count = self.id_frame_counts.get(global_id, 1)
-            reliability = min(frame_count / 50, 1.0)  # Пример: нормализуем до 1.0
-
-            # Обновление центроида галереи как скользящего среднего с учётом надежности
-            dynamic_alpha = self._alpha * reliability  # Более надёжные центроиды обновляются медленнее
-            self.gallery_centroids[global_id] = dynamic_alpha * embedding + (1 - dynamic_alpha) * self.gallery_centroids[global_id]
+            # Обновление центроида галереи как скользящего среднего
+            self.gallery_centroids[global_id] = self._alpha * embedding + (1 - self._alpha) * self.gallery_centroids[global_id]
             self.gallery_centroids[global_id] = F.normalize(self.gallery_centroids[global_id], p=2, dim=0)
 
     def _match_with_centroids(self, embeddings: List[torch.Tensor], local_ids: List[str]) -> Dict[str, Tuple[int, float]]:
@@ -213,7 +150,7 @@ class MCMOT:
                 similarity = torch.dot(emb_normalized, gallery_centroid).item()
                 gallery_similarities[gallery_id] = similarity
 
-            # Ищем лучшее совпадение среди треков
+            # Находим лучшее совпадение в текущих треках
             if similarities:
                 best_global_id = max(similarities, key=similarities.get)
                 max_similarity = similarities[best_global_id]
@@ -221,45 +158,64 @@ class MCMOT:
                 best_global_id = None
                 max_similarity = -1
 
-            # Если сходство с треком низкое, ищем в галерее
+            # Если не нашли хорошее совпадение, ищем в галерее
             if max_similarity < self._similarity_threshold:
                 if gallery_similarities:
                     best_gallery_id = max(gallery_similarities, key=gallery_similarities.get)
                     gallery_max_similarity = gallery_similarities[best_gallery_id]
+                    if gallery_max_similarity > self._gallery_similarity_threshold:
+                        best_global_id = best_gallery_id
+                        max_similarity = gallery_max_similarity
+                        # Обновляем центроид текущего трека на основе галереи
+                        self.id_centroids[best_global_id] = self._alpha * emb_normalized + (1 - self._alpha) * self.id_centroids.get(best_global_id, emb_normalized)
+                        self.id_centroids[best_global_id] = F.normalize(self.id_centroids[best_global_id], p=2, dim=0)
+                    else:
+                        best_global_id = None
+                else:
+                    best_global_id = None
 
-                    # Проверяем, свободен ли gallery_id или уже присвоен текущему global_id
-                    existing_global_id = self.gallery_id_to_global_id.get(best_gallery_id, None)
-                    if gallery_max_similarity > self._gallery_similarity_threshold and (existing_global_id is None or existing_global_id == best_global_id):
-                        # Присваиваем gallery_id текущему global_id
-                        matches[local_id] = (best_gallery_id, gallery_max_similarity)
-                        # Обновляем центроид трека
-                        self.id_centroids[best_gallery_id] = self._alpha * emb_normalized + (1 - self._alpha) * self.id_centroids.get(best_gallery_id, emb_normalized)
-                        self.id_centroids[best_gallery_id] = F.normalize(self.id_centroids[best_gallery_id], p=2, dim=0)
-                        # Обновляем галерею
-                        self._update_gallery(best_gallery_id, emb_normalized)
-                        # Обновляем маппинг
-                        self.gallery_id_to_global_id[best_gallery_id] = best_gallery_id
-                        continue
-
-            # Если нашли хорошее совпадение с треком
-            if best_global_id is not None and max_similarity >= self._similarity_threshold:
+            if best_global_id is not None and max_similarity > self._similarity_threshold:
                 matches[local_id] = (best_global_id, max_similarity)
-                # Обновляем центроид трека
+                # Обновляем центроид
                 self._update_centroid(best_global_id, emb_normalized)
             else:
-                # Если совпадение не найдено, назначаем новый global_id и gallery_id
-                new_global_id = self._global_id
-                self._global_id += 1
-                self.id_centroids[new_global_id] = emb_normalized
-                self.id_embedding_buffers[new_global_id] = [emb_normalized]
-                self.id_frame_counts[new_global_id] = 1
-                matches[local_id] = (new_global_id, 0.0)  # similarity 0.0 для новых ID
-
-                # Присваиваем новый gallery_id, совпадающий с global_id
-                self.gallery_centroids[new_global_id] = emb_normalized
-                self.gallery_id_to_global_id[new_global_id] = new_global_id
-
+                # Если нет хорошего совпадения, проверяем галерею
+                if gallery_similarities and max(gallery_similarities.values()) > self._gallery_similarity_threshold:
+                    best_gallery_id = max(gallery_similarities, key=gallery_similarities.get)
+                    matches[local_id] = (best_gallery_id, gallery_similarities[best_gallery_id])
+                    # Обновляем центроид и галерею
+                    self.id_centroids[best_gallery_id] = self._alpha * emb_normalized + (1 - self._alpha) * self.id_centroids.get(best_gallery_id, emb_normalized)
+                    self.id_centroids[best_gallery_id] = F.normalize(self.id_centroids[best_gallery_id], p=2, dim=0)
+                    self._update_gallery(best_gallery_id, emb_normalized)
+                else:
+                    # Назначаем новый global_id
+                    new_global_id = self._global_id
+                    self._global_id += 1
+                    self.id_centroids[new_global_id] = emb_normalized
+                    matches[local_id] = (new_global_id, 0.0)
+                    # Добавляем в буфер эмбеддингов
+                    self.id_embedding_buffers[new_global_id] = [emb_normalized]
         return matches
+
+    def _update_centroid(self, global_id: int, new_embedding: torch.Tensor):
+        """
+        Обновляет центроид для global_id новым эмбеддингом и обновляет буфер эмбеддингов.
+
+        :param global_id: Глобальный идентификатор.
+        :param new_embedding: Новый эмбеддинг.
+        """
+        # Обновляем центроид (скользящее среднее)
+        old_centroid = self.id_centroids.get(global_id, new_embedding)
+        updated_centroid = self._alpha * new_embedding + (1 - self._alpha) * old_centroid
+        updated_centroid = F.normalize(updated_centroid, p=2, dim=0)
+        self.id_centroids[global_id] = updated_centroid
+
+        # Обновляем буфер эмбеддингов
+        if global_id not in self.id_embedding_buffers:
+            self.id_embedding_buffers[global_id] = []
+        self.id_embedding_buffers[global_id].append(new_embedding)
+        if len(self.id_embedding_buffers[global_id]) > self.buffer_size:
+            self.id_embedding_buffers[global_id].pop(0)
 
     def _assign_global_ids(self, matches: Dict[str, Tuple[int, float]], frames_bboxes: List[Dict[int, Dict]]) -> List[Dict[int, Dict]]:
         """
@@ -272,28 +228,23 @@ class MCMOT:
         for cam_id, frame_bboxes in enumerate(frames_bboxes):
             updated_bboxes = {}
             for local_id, data in frame_bboxes.items():
-                id_code = f'{cam_id}-{local_id}'
-                if id_code in matches:
-                    global_id, similarity = matches[id_code]
+                if local_id in matches:
+                    global_id, similarity = matches[local_id]
                     bbox_info = data.copy()
                     bbox_info['similarity'] = similarity
                     updated_bboxes[global_id] = bbox_info
                 else:
-                    # Назначаем новый global_id и gallery_id, если нет совпадения
+                    # Назначаем новый global_id, если нет совпадения
                     new_global_id = self._global_id
                     self._global_id += 1
                     updated_bboxes[new_global_id] = {
                         'bbox': data['bbox'],
                         'similarity': None
                     }
-                    # Инициализируем центроид и галерею
+                    # Инициализируем центроид, если необходимо
                     emb = self.id_centroids.get(new_global_id)
                     if emb is not None:
                         self.id_embedding_buffers[new_global_id] = [emb]
-                        self.id_frame_counts[new_global_id] = 1
-                        # Присваиваем gallery_id, совпадающий с global_id
-                        self.gallery_centroids[new_global_id] = emb
-                        self.gallery_id_to_global_id[new_global_id] = new_global_id
             frames_bboxes[cam_id] = updated_bboxes
         return frames_bboxes
 
@@ -327,7 +278,6 @@ class MCMOT:
             det_frames.append((f'cam # {cam_i}', det_frame))
         return det_frames
 
-
     def _write_logs(self, timestamp: int, frames_bboxes: List[Dict[int, Dict]], log_filenames: List[str]):
         """
         Записывает логи для каждого кадра.
@@ -342,12 +292,7 @@ class MCMOT:
                 for track_id, data in frame_bboxes.items():
                     bbox = data['bbox']
                     x1, y1, x2, y2 = bbox
-                    # Получаем gallery_id для текущего track_id, если он есть
-                    gallery_id = self.global_id_to_gallery_id.get(track_id)
-                    # Если gallery_id отсутствует, используем track_id как есть
-                    final_track_id = gallery_id if gallery_id is not None else track_id
-                    log.write(f"{timestamp}, {final_track_id}, {x1}, {y1}, {x2 - x1}, {y2 - y1}, 1, 1, 1, 1\n")
-
+                    log.write(f"{timestamp}, {track_id}, {x1}, {y1}, {x2 - x1}, {y2 - y1}, 1, 1, 1, 1\n")
 
     def _periodic_gallery_check(self):
         """
@@ -370,29 +315,15 @@ class MCMOT:
                         best_gallery_id = gallery_id
 
                 if max_similarity > self._gallery_similarity_threshold:
-                    # Проверяем, соответствует ли gallery_id текущему global_id
-                    existing_global_id = self.gallery_id_to_global_id.get(best_gallery_id, None)
-                    if existing_global_id is None or existing_global_id == global_id:
-                        # Обновляем галерейный центроид
-                        self.gallery_centroids[best_gallery_id] = centroid
-                        # Обновляем соответствие
-                        self.gallery_id_to_global_id[best_gallery_id] = global_id
-                        self.global_id_to_gallery_id[global_id] = best_gallery_id
-                    else:
-                        # Если gallery_id уже присвоен другому global_id, создаём новый gallery_id
-                        new_gallery_id = self.next_gallery_id
-                        self.next_gallery_id += 1
-                        self.gallery_centroids[new_gallery_id] = centroid
-                        self.gallery_id_to_global_id[new_gallery_id] = global_id
-                        self.global_id_to_gallery_id[global_id] = new_gallery_id
-                        print(f"Добавлен новый человек в галерею: Gallery ID {new_gallery_id} для Global ID {global_id}")
-
+                    # Обновляем галерейный центроид
+                    self.gallery_centroids[best_gallery_id] = centroid
+                    # Обновляем соответствие
+                    self.global_id_to_gallery_id[global_id] = best_gallery_id
                 else:
                     # Добавляем новый gallery_id
                     new_gallery_id = self.next_gallery_id
                     self.next_gallery_id += 1
                     self.gallery_centroids[new_gallery_id] = centroid
-                    self.gallery_id_to_global_id[new_gallery_id] = global_id
                     self.global_id_to_gallery_id[global_id] = new_gallery_id
                     print(f"Добавлен новый человек в галерею: Gallery ID {new_gallery_id} для Global ID {global_id}")
 
@@ -443,6 +374,38 @@ class MCMOT:
 
         return det_frames
 
+    def _assign_global_ids(self, matches: Dict[str, Tuple[int, float]], frames_bboxes: List[Dict[int, Dict]]) -> List[Dict[int, Dict]]:
+        """
+        Обновляет bounding boxes с глобальными ID и сходствами.
+
+        :param matches: Словарь, отображающий локальные ID в кортеж (global_id, similarity).
+        :param frames_bboxes: Список словарей bbox по кадрам.
+        :return: Обновлённый список словарей bbox по кадрам.
+        """
+        for cam_id, frame_bboxes in enumerate(frames_bboxes):
+            updated_bboxes = {}
+            for local_id, data in frame_bboxes.items():
+                id_code = f'{cam_id}-{local_id}'
+                if id_code in matches:
+                    global_id, similarity = matches[id_code]
+                    bbox_info = data.copy()
+                    bbox_info['similarity'] = similarity
+                    updated_bboxes[global_id] = bbox_info
+                else:
+                    # Назначаем новый global_id, если нет совпадения
+                    new_global_id = self._global_id
+                    self._global_id += 1
+                    updated_bboxes[new_global_id] = {
+                        'bbox': data['bbox'],
+                        'similarity': None
+                    }
+                    # Инициализируем центроид, если необходимо
+                    emb = self.id_centroids.get(new_global_id)
+                    if emb is not None:
+                        self.id_embedding_buffers[new_global_id] = [emb]
+            frames_bboxes[cam_id] = updated_bboxes
+        return frames_bboxes
+
     def _get_persons_embeddings(
         self,
         frames: List[np.ndarray],
@@ -458,7 +421,7 @@ class MCMOT:
         frames_embeddings = []
         frames_bboxes = []
         for cam_id, frame in zip(cam_ids, frames):
-            results = self._detectors[cam_id].track(frame, persist=True, classes=[0], verbose=True, tracker=self._tracker_path, iou=0.85, imgsz=800)
+            results = self._detectors[cam_id].track(frame, persist=True, classes=[0], verbose=True, tracker=self._tracker_path)
             boxes = results[0].boxes
             embeddings, ids = self._get_features(frame, boxes)
             frames_embeddings.append({lid: emb for lid, emb in zip(ids, embeddings) if emb is not None})
@@ -545,8 +508,8 @@ if __name__ == '__main__':
         person_detector=YOLO(os.path.join(args.mount, "yolov11s_trained.pt")),
         feature_extractor=create_reid_model(os.path.join(args.mount, 'best_reid_model.pth')),
         similarity_threshold=0.75,
-        gallery_similarity_threshold=0.88,
-        alpha=0.13,
+        gallery_similarity_threshold=0.85,
+        alpha=0.1,
         confirmation_threshold=12,
         num_cams=len(videos_list),
         log_dir=args.save_dir,
