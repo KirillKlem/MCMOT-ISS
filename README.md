@@ -7,10 +7,12 @@
 
 ---
 
-## Модели reID
+## Модели
 
-[📂 Скачать модели](https://drive.google.com/drive/folders/1HhoybORgO1O5dPV7AlhdCZKXMWB9ukTj?usp=sharing)  
+[📂 Скачать модели reID](https://drive.google.com/drive/folders/1HhoybORgO1O5dPV7AlhdCZKXMWB9ukTj?usp=sharing)  
 *(Загрузите файлы в папку `assets` для корректной работы.)*
+
+[📂 Скачать любвую из обученных нами модели](https://drive.google.com/drive/folders/1FUs-KjeIzeJwQNuuX71a9HEF-WYZLhml?usp=drive_link)  
 
 ---
 
